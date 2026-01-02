@@ -6,13 +6,20 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.VerimorService = void 0;
 const axios_1 = __importDefault(require("axios"));
 const pg_1 = require("pg");
-const VERIMOR_BASE_URL = 'https://api.bulutsantralim.com';
-const VERIMOR_API_KEY = process.env.VERIMOR_API_KEY || '75b14ed2-ed68-4f42-863f-80920605db0b';
+// Verimor API Configuration
+const VERIMOR_BASE_URL = process.env.VERIMOR_BASE_URL || 'https://api.bulutsantralim.com';
+const VERIMOR_API_KEY = process.env.VERIMOR_API_KEY || '';
 const VERIMOR_USERNAME = process.env.VERIMOR_USERNAME || '';
 const VERIMOR_PASSWORD = process.env.VERIMOR_PASSWORD || '';
 const VERIMOR_MOCK_MODE = process.env.VERIMOR_MOCK_MODE === 'true';
+// n8n Webhook URL for Voice AI
+const N8N_VOICE_WEBHOOK_URL = process.env.N8N_VOICE_WEBHOOK_URL || '';
 const pool = new pg_1.Pool({ connectionString: process.env.DATABASE_URL });
 class VerimorService {
+    /**
+     * Initiate an outbound call using Verimor's /originate endpoint
+     * Uses HTTP Basic Auth as per Verimor API docs
+     */
     static async makeCall(extension, destination) {
         const cleanExtension = extension.replace(/[\s+]/g, '');
         const cleanDestination = destination.replace(/[\s+]/g, '');
@@ -20,7 +27,6 @@ class VerimorService {
             console.log('=== VERIMOR MOCK MODE ===');
             console.log('Extension:', cleanExtension);
             console.log('Destination:', cleanDestination);
-            console.log('MOCK: Call would be initiated');
             return {
                 success: true,
                 message: 'Call simulated successfully (mock mode)',
@@ -28,74 +34,172 @@ class VerimorService {
             };
         }
         try {
-            const url = `${VERIMOR_BASE_URL}/begin_call`;
-            console.log('=== VERIMOR API CALL ===');
+            // Use the correct /originate endpoint
+            const url = `${VERIMOR_BASE_URL}/originate`;
+            console.log('=== VERIMOR ORIGINATE CALL ===');
             console.log('URL:', url);
             console.log('Extension:', cleanExtension);
             console.log('Destination:', cleanDestination);
-            console.log('Has Basic Auth:', !!VERIMOR_USERNAME);
+            console.log('Username:', VERIMOR_USERNAME);
+            // Build request config with HTTP Basic Auth
             const axiosConfig = {
-                timeout: 30000
+                timeout: 30000,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
             };
+            // Always use HTTP Basic Auth if credentials are available
             if (VERIMOR_USERNAME && VERIMOR_PASSWORD) {
-                console.log('Using Basic Authentication + API Key');
-                console.log('Username:', VERIMOR_USERNAME);
-                const authHeader = 'Basic ' + Buffer.from(VERIMOR_USERNAME + ':' + VERIMOR_PASSWORD).toString('base64');
-                axiosConfig.headers = {
-                    'Authorization': authHeader
+                axiosConfig.auth = {
+                    username: VERIMOR_USERNAME,
+                    password: VERIMOR_PASSWORD
                 };
-                const maskedKey = VERIMOR_API_KEY.substring(0, 8) + '...' + VERIMOR_API_KEY.substring(VERIMOR_API_KEY.length - 4);
-                console.log('API Key (masked):', maskedKey);
-                axiosConfig.params = {
-                    key: VERIMOR_API_KEY,
-                    extension: cleanExtension,
-                    destination: cleanDestination,
-                    auto_answer: true
-                };
+                console.log('Using HTTP Basic Auth');
             }
-            else {
-                console.log('Using API Key Authentication only');
-                const maskedKey = VERIMOR_API_KEY.substring(0, 8) + '...' + VERIMOR_API_KEY.substring(VERIMOR_API_KEY.length - 4);
-                console.log('API Key (masked):', maskedKey);
-                axiosConfig.params = {
-                    key: VERIMOR_API_KEY,
-                    extension: cleanExtension,
-                    destination: cleanDestination,
-                    auto_answer: true
-                };
+            // Request body for originate
+            const requestBody = {
+                extension: cleanExtension,
+                destination: cleanDestination,
+                auto_answer: true
+            };
+            // Add API key if provided (some Verimor setups require it)
+            if (VERIMOR_API_KEY) {
+                requestBody.key = VERIMOR_API_KEY;
+                console.log('API Key included in request');
             }
-            const response = await axios_1.default.get(url, axiosConfig);
+            console.log('Request Body:', JSON.stringify(requestBody, null, 2));
+            const response = await axios_1.default.post(url, requestBody, axiosConfig);
             console.log('Response Status:', response.status);
-            console.log('Response Headers:', JSON.stringify(response.headers, null, 2));
             console.log('Response Data:', response.data);
             return {
                 success: true,
                 message: 'Call initiated successfully',
-                data: { call_uuid: response.data }
+                data: {
+                    call_uuid: response.data?.call_uuid || response.data,
+                    raw_response: response.data
+                }
             };
         }
         catch (error) {
-            console.error('=== VERIMOR API ERROR ===');
+            console.error('=== VERIMOR ORIGINATE ERROR ===');
             console.error('Error Message:', error.message);
             if (error.response) {
                 console.error('Status:', error.response.status);
                 console.error('Status Text:', error.response.statusText);
                 console.error('Response Headers:', JSON.stringify(error.response.headers, null, 2));
                 console.error('Response Data:', error.response.data);
-                if (error.response.status === 401 || error.response.status === 403 || error.response.status === 404) {
-                    console.log('FALLBACK: API auth failed, switching to mock mode');
-                    const mockResult = await this.mockCall(cleanExtension, cleanDestination);
-                    return mockResult;
+                // If auth error, try alternative auth method
+                if (error.response.status === 401 || error.response.status === 403) {
+                    console.log('Auth failed, trying alternative method with query params...');
+                    return this.makeCallWithQueryParams(cleanExtension, cleanDestination);
                 }
             }
-            else if (error.request) {
-                console.error('No response received:', error.request);
+            return {
+                success: false,
+                message: error.response?.data?.message || error.response?.data || error.message || 'Failed to initiate call'
+            };
+        }
+    }
+    /**
+     * Alternative call method using query parameters (fallback)
+     */
+    static async makeCallWithQueryParams(extension, destination) {
+        try {
+            const url = `${VERIMOR_BASE_URL}/originate`;
+            console.log('=== VERIMOR ORIGINATE (Query Params Fallback) ===');
+            const params = {
+                extension: extension,
+                destination: destination,
+                auto_answer: true
+            };
+            // Add credentials as query params
+            if (VERIMOR_API_KEY) {
+                params.key = VERIMOR_API_KEY;
+            }
+            if (VERIMOR_USERNAME) {
+                params.username = VERIMOR_USERNAME;
+            }
+            if (VERIMOR_PASSWORD) {
+                params.password = VERIMOR_PASSWORD;
+            }
+            const response = await axios_1.default.get(url, {
+                params,
+                timeout: 30000
+            });
+            console.log('Fallback Response Status:', response.status);
+            console.log('Fallback Response Data:', response.data);
+            return {
+                success: true,
+                message: 'Call initiated successfully (fallback method)',
+                data: { call_uuid: response.data }
+            };
+        }
+        catch (error) {
+            console.error('=== VERIMOR FALLBACK ERROR ===');
+            console.error('Error:', error.message);
+            if (error.response) {
+                console.error('Response Status:', error.response.status);
+                console.error('Response Data:', error.response.data);
             }
             return {
                 success: false,
                 message: error.response?.data || error.message || 'Failed to initiate call'
             };
         }
+    }
+    /**
+     * Forward incoming call data to n8n for Voice AI processing
+     */
+    static async forwardToN8n(webhookData) {
+        if (!N8N_VOICE_WEBHOOK_URL) {
+            console.log('N8N_VOICE_WEBHOOK_URL not configured, skipping forward');
+            return null;
+        }
+        try {
+            console.log('=== FORWARDING TO N8N ===');
+            console.log('N8N URL:', N8N_VOICE_WEBHOOK_URL);
+            console.log('Payload:', JSON.stringify(webhookData, null, 2));
+            const response = await axios_1.default.post(N8N_VOICE_WEBHOOK_URL, webhookData, {
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                timeout: 10000
+            });
+            console.log('N8N Response Status:', response.status);
+            console.log('N8N Response Data:', response.data);
+            return response.data;
+        }
+        catch (error) {
+            console.error('=== N8N FORWARD ERROR ===');
+            console.error('Error:', error.message);
+            if (error.response) {
+                console.error('Response Status:', error.response.status);
+                console.error('Response Data:', error.response.data);
+            }
+            // Don't throw - we don't want to fail the Verimor webhook response
+            return null;
+        }
+    }
+    /**
+     * Generate Verimor response to play an audio file
+     */
+    static generatePlayAudioResponse(audioUrl) {
+        return {
+            success: true,
+            action: 'play',
+            audio_url: audioUrl
+        };
+    }
+    /**
+     * Generate Verimor response to hangup the call
+     */
+    static generateHangupResponse(reason) {
+        return {
+            success: true,
+            action: 'hangup',
+            reason: reason || 'completed'
+        };
     }
     static async mockCall(extension, destination) {
         const mockCallUuid = 'mock-fallback-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
@@ -164,7 +268,7 @@ class VerimorService {
                 await client.query('ROLLBACK');
                 throw new Error('Numara bulunamadı: ' + didNumber);
             }
-            const { id: numberId, tenant_id: tenantId, agent_id: agentId } = numberResult.rows[0];
+            const { id: numberId, agent_id: agentId } = numberResult.rows[0];
             await client.query("UPDATE verimor_numbers SET status = 'available', tenant_id = NULL, agent_id = NULL, assigned_at = NULL WHERE id = $1", [numberId]);
             console.log('Numara serbest bırakıldı');
             if (agentId) {

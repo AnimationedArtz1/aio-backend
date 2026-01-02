@@ -2,13 +2,16 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
 import { Pool } from 'pg';
 import { AuthService } from './services/auth.service';
 import { PaynetService } from './services/paynet.service';
 import { TwilioService } from './services/twilio.service';
 import { AgentService } from './services/agent.service';
 import { UserService } from './services/user.service';
-import { VerimorService } from './services/verimor.service';
+import { VerimorService, VerimorWebhookData } from './services/verimor.service';
 
 dotenv.config();
 
@@ -16,9 +19,52 @@ const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const JWT_SECRET = process.env.JWT_SECRET || 'super_gizli_jwt_sifresi_bunu_degistir';
 
-// CORS: Hepsine izin ver
+// Ensure public/audio directory exists
+const AUDIO_DIR = path.join(__dirname, '..', 'public', 'audio');
+if (!fs.existsSync(AUDIO_DIR)) {
+    fs.mkdirSync(AUDIO_DIR, { recursive: true });
+    console.log('Created audio directory:', AUDIO_DIR);
+}
+
+// Configure multer for audio file uploads
+const audioStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, AUDIO_DIR);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const ext = path.extname(file.originalname) || '.mp3';
+        cb(null, `audio-${uniqueSuffix}${ext}`);
+    }
+});
+
+const audioUpload = multer({
+    storage: audioStorage,
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB max
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedMimes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/webm'];
+        if (allowedMimes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only audio files are allowed.'));
+        }
+    }
+});
+
+// CORS: Allow all origins
 app.use(cors({ origin: '*' }));
+
+// Parse JSON bodies
 app.use(express.json());
+
+// Parse URL-encoded bodies (important for Verimor webhooks)
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static files from public directory
+app.use('/public', express.static(path.join(__dirname, '..', 'public')));
+
 
 // Request Logging
 app.use((req, res, next) => {
@@ -54,12 +100,12 @@ apiRouter.post('/paynet/create-session', async (req, res) => {
         // Plan bilgisini referans koduna ekle
         const fullRef = planId ? `${referenceCode}-${planId}` : referenceCode;
 
-         const result = await PaynetService.createPaymentLink({ amount, referenceCode: fullRef, email, name });
+        const result = await PaynetService.createPaymentLink({ amount, referenceCode: fullRef, email, name });
         res.json({
             success: true,
             url: result.url,
             referenceCode: fullRef,
-            sessionId: result.session_id
+            sessionId: result.sessionId
         });
     } catch (e: any) {
         console.error('Paynet Create Session Error:', e.message);
@@ -119,7 +165,7 @@ apiRouter.post('/billing/checkout', async (req, res) => {
         res.json({
             redirectUrl: result.url,
             checkoutUrl: result.url,
-            sessionId: result.session_id
+            sessionId: result.sessionId
         });
     } catch (e: any) {
         console.error('Billing Checkout Error:', e.message);
@@ -131,16 +177,16 @@ apiRouter.post('/billing/checkout', async (req, res) => {
 apiRouter.post('/paynet/callback', async (req, res) => {
     try {
         console.log('Paynet Callback Received:', req.body);
-        
-        const { 
-            status, 
-            reference_no, 
-            email, 
+
+        const {
+            status,
+            reference_no,
+            email,
             name_surname,
             amount,
-            transaction_id 
+            transaction_id
         } = req.body;
-        
+
         if (status === '1' || status === 'success' || status === 1) {
             // Ödeme başarılı
             console.log(`Ödeme başarılı: ${email}, Ref: ${reference_no}`);
@@ -275,14 +321,14 @@ apiRouter.post('/integrations/verimor/call', async (req, res) => {
 apiRouter.get('/verimor/incoming-call', async (req, res) => {
     try {
         const data = req.query;
-        
+
         console.log('=== VERIMOR INCOMING CALL WEBHOOK (GET) ===');
         console.log('Data:', JSON.stringify(data, null, 2));
         console.log('UUID:', data.uuid);
         console.log('CLI (Caller ID):', data.cli);
         console.log('CLD (Target/Extension):', data.cld);
         console.log('Step:', data.step);
-        
+
         return res.status(200).json({
             success: true,
             action: 'continue'
@@ -299,14 +345,14 @@ apiRouter.get('/verimor/incoming-call', async (req, res) => {
 apiRouter.post('/verimor/incoming-call', async (req, res) => {
     try {
         const data = req.body || {};
-        
+
         console.log('=== VERIMOR INCOMING CALL WEBHOOK (POST) ===');
         console.log('Data:', JSON.stringify(data, null, 2));
         console.log('UUID:', data.uuid);
         console.log('CLI (Caller ID):', data.cli);
         console.log('CLD (Target/Extension):', data.cld);
         console.log('Step:', data.step);
-        
+
         return res.status(200).json({
             success: true,
             transfer: {
@@ -337,146 +383,196 @@ apiRouter.stack.forEach((layer: any) => {
 console.log('[ROUTE] apiRouter mounted on /api');
 
 // ============================================
-// Verimor Call Integration - For n8n triggering
+// VERIMOR ROBUST WEBHOOK HANDLER
+// This handler responds 200 OK IMMEDIATELY to prevent 404/timeout errors
+// It handles GET (validation) and POST (events) requests
 // ============================================
-apiRouter.post('/integrations/verimor/call', async (req, res) => {
+const handleVerimorWebhook = async (req: any, res: any) => {
+    // CRITICAL: Send 200 OK immediately to prevent Verimor timeout/error
+    // We send response BEFORE processing to ensure Verimor gets OK
+    const timestamp = new Date().toISOString();
+
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║           VERIMOR WEBHOOK RECEIVED                           ║');
+    console.log('╠══════════════════════════════════════════════════════════════╣');
+    console.log(`║ Timestamp: ${timestamp}`);
+    console.log(`║ Method: ${req.method}`);
+    console.log(`║ Path: ${req.path}`);
+    console.log(`║ Original URL: ${req.originalUrl}`);
+    console.log(`║ Content-Type: ${req.get('content-type') || 'none'}`);
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+
     try {
-        const { target_number } = req.body;
-        
-        if (!target_number) {
-            return res.status(400).json({ error: 'target_number is required' });
-        }
-        
-        const DEMO_EXTENSION = '902422555761';
-        
-        console.log('=== VERIMOR CALL REQUEST ===');
-        console.log('Extension (Source):', DEMO_EXTENSION);
-        console.log('Destination (Target):', target_number);
-        
-        const result = await VerimorService.makeCall(DEMO_EXTENSION, target_number);
-        
-        if (result.success) {
-            res.json({
-                success: true,
-                message: 'Call initiated',
-                data: result.data
-            });
+        // Extract data from query params (GET) or body (POST)
+        let data: VerimorWebhookData = {};
+
+        if (req.method === 'GET') {
+            data = { ...req.query };
+            console.log('[Verimor] Using query parameters (GET validation request)');
         } else {
-            res.status(500).json({
+            // POST - could be JSON or form-urlencoded
+            data = { ...req.query, ...req.body };
+            console.log('[Verimor] Using body + query (POST event request)');
+        }
+
+        console.log('[Verimor] Parsed Data:', JSON.stringify(data, null, 2));
+        console.log('[Verimor] UUID:', data.uuid || 'N/A');
+        console.log('[Verimor] CLI (Caller):', data.cli || 'N/A');
+        console.log('[Verimor] CLD (Called):', data.cld || 'N/A');
+        console.log('[Verimor] Step:', data.step || 'N/A');
+        console.log('[Verimor] Event:', data.event || 'N/A');
+
+        // Forward to n8n asynchronously (don't wait for response)
+        setImmediate(async () => {
+            try {
+                const n8nResponse = await VerimorService.forwardToN8n(data);
+                if (n8nResponse) {
+                    console.log('[Verimor->n8n] Forward successful:', n8nResponse);
+                }
+            } catch (err: any) {
+                console.error('[Verimor->n8n] Forward error:', err.message);
+            }
+        });
+
+        // Return 200 OK with simple response
+        // Verimor expects either plain text 'OK' or simple JSON
+        res.status(200).send('OK');
+
+    } catch (error: any) {
+        console.error('[Verimor] Webhook processing error:', error.message);
+        // STILL return 200 OK to prevent Verimor from marking webhook as failed
+        res.status(200).send('OK');
+    }
+};
+
+// ============================================
+// MOUNT VERIMOR WEBHOOK ON ALL PATH VARIATIONS
+// Using app.all() to catch GET, POST, PUT, DELETE, OPTIONS etc.
+// ============================================
+const verimorPaths = [
+    '/api/verimor/incoming-call',
+    '/api/verimor/incoming-call/',
+    '/verimor/incoming-call',
+    '/verimor/incoming-call/',
+    '/api/verimor/webhook',
+    '/api/verimor/webhook/',
+    '/verimor/webhook',
+    '/verimor/webhook/',
+    '/api/webhook/verimor',
+    '/api/webhook/verimor/',
+    '/webhook/verimor',
+    '/webhook/verimor/'
+];
+
+verimorPaths.forEach(p => {
+    app.all(p, handleVerimorWebhook);
+    console.log(`[VERIMOR] Mounted catch-all on: ${p}`);
+});
+
+// ============================================
+// AUDIO UPLOAD ENDPOINT - For n8n Voice AI
+// n8n generates TTS audio and uploads here
+// Returns public URL for Verimor to play
+// ============================================
+app.post('/api/upload-audio', audioUpload.single('audio'), (req: any, res) => {
+    try {
+        console.log('=== AUDIO UPLOAD REQUEST ===');
+
+        if (!req.file) {
+            console.error('No audio file in request');
+            return res.status(400).json({
                 success: false,
-                message: result.message
+                error: 'No audio file provided. Use field name "audio"'
             });
         }
+
+        const filename = req.file.filename;
+        const publicUrl = `https://api.aioasistan.com/public/audio/${filename}`;
+        const localUrl = `http://localhost:${process.env.PORT || 3000}/public/audio/${filename}`;
+
+        console.log('File saved:', req.file.path);
+        console.log('Public URL:', publicUrl);
+        console.log('Local URL:', localUrl);
+
+        res.json({
+            success: true,
+            filename: filename,
+            url: publicUrl,
+            localUrl: localUrl,
+            size: req.file.size,
+            mimetype: req.file.mimetype
+        });
+
     } catch (error: any) {
-        console.error('Verimor Call Error:', error.message);
-        res.status(500).json({ error: error.message });
+        console.error('Audio upload error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Also mount on path without /api prefix
+app.post('/upload-audio', audioUpload.single('audio'), (req: any, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No audio file provided' });
+        }
+
+        const filename = req.file.filename;
+        const publicUrl = `https://api.aioasistan.com/public/audio/${filename}`;
+
+        res.json({
+            success: true,
+            filename: filename,
+            url: publicUrl,
+            size: req.file.size
+        });
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // ============================================
-// Verimor Incoming Call Webhook - For Verimor Panel
+// VERIMOR PLAY AUDIO RESPONSE HELPER ENDPOINT
+// Returns proper JSON command for Verimor to play audio
 // ============================================
-const handleVerimorWebhook = async (req: any, res: any) => {
+app.post('/api/verimor/play', express.json(), (req, res) => {
     try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        console.log('Content-Type:', req.get('content-type'));
-        
-        let data: any = {};
-        
-        if (req.method === 'GET') {
-            data = req.query;
-            console.log('Using query parameters (GET)');
-        } else if (req.method === 'POST') {
-            const contentType = req.get('content-type');
-            
-            if (contentType && contentType.includes('application/x-www-form-urlencoded')) {
-                console.log('Using form-encoded body (POST)');
-                data = req.body;
-            } else if (contentType && contentType.includes('application/json')) {
-                console.log('Using JSON body (POST)');
-                data = req.body;
-            } else {
-                console.log('Using both query and body (fallback)');
-                data = { ...req.query, ...req.body };
-            }
-        }
-        
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        
-        return res.status(200).send('OK');
+        const { audio_url, uuid } = req.body;
+
+        console.log('=== VERIMOR PLAY AUDIO ===');
+        console.log('Audio URL:', audio_url);
+        console.log('Call UUID:', uuid);
+
+        // Return Verimor-compatible response
+        res.json({
+            success: true,
+            action: 'play',
+            audio_url: audio_url,
+            uuid: uuid
+        });
+
     } catch (error: any) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
+        console.error('Play audio error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
-};
+});
 
-// Mount Verimor webhook on all 4 path variations on app directly
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
-
-// ============================================
-
-// ============================================
-// Verimor Shared Webhook Handler - Prevents trailing slash & redirects
-// ============================================
-const handleVerimorWebhook = async (req: any, res: any) => {
-    try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        
-        const data = req.query || req.body || {};
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        
-        return res.status(200).send('OK');
-    } catch (error: any) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
-    }
-};
-
-// Mount on all 4 path variations
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
 
 // ============================================
 // AUTH MIDDLEWARE
 // ============================================
 const authenticate = (req: any, res: any, next: any) => {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Token gerekli' });
     }
-    
+
     const token = authHeader.split(' ')[1];
-    
+
     try {
         const decoded = jwt.verify(token, JWT_SECRET) as any;
         req.user = {
@@ -550,15 +646,15 @@ apiRouter.post('/n8n/webhook', async (req, res) => {
     try {
         console.log('=== N8N WEBHOOK RECEIVED ===');
         console.log('Webhook Data:', JSON.stringify(req.body, null, 2));
-        
+
         // Twilio Voice Request formatı: { CallSid, From, To, CallStatus, CallerName, ... }
         const { From: caller, To: callee, CallSid, CallStatus } = req.body;
-        
+
         // Arayan numara (caller) veya aranılan numara (callee) al
         const phoneNumber = caller || callee;
-        
+
         console.log(`Aranan numara: ${phoneNumber}`);
-        
+
         // Agent bilgilerini getir (aranan numaraya göre)
         // Hem Twilio hem Verimor numaralarını kontrol et
         const agentResult = await pool.query(
@@ -577,13 +673,13 @@ apiRouter.post('/n8n/webhook', async (req, res) => {
                 message: 'Bu numaraya atanmış bir agent yok'
             });
         }
-        
+
         const agent = agentResult.rows[0];
-        
+
         console.log('Bulunan Agent:', agent.name);
         console.log('System Prompt:', agent.system_prompt);
         console.log('Tenant:', agent.tenant_slug);
-        
+
         // n8n için TwiML response
         const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -591,12 +687,12 @@ apiRouter.post('/n8n/webhook', async (req, res) => {
     <Say>Hello! AIO Asistanınız ile görüşüyorsunuz.</Say>
   </Gather>
 </Response>`;
-        
+
         console.log('Twilio Response:', twiml);
-        
+
         res.setHeader('Content-Type', 'application/xml');
         res.send(twiml);
-        
+
     } catch (error: any) {
         console.error('N8n Webhook Error:', error.message);
         res.status(500).json({ error: error.message });
@@ -715,41 +811,8 @@ apiRouter.get('/admin/verimor/numbers', async (req, res) => {
 });
 
 // ============================================
-// Verimor Shared Webhook Handler - Prevents trailing slash & redirects
-// ============================================
-const handleVerimorWebhook = async (req: any, res: any) => {
-    try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        
-        const data = req.query || req.body || {};
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        
-        return res.status(200).send('OK');
-    } catch (error: any) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
-    }
-};
-
-// Mount on all 4 path variations to prevent trailing slash issues
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
-
-// ============================================
 // Health check
+
 apiRouter.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -771,8 +834,8 @@ apiRouter.post('/payment/test-connection', async (req, res) => {
                 success: false,
                 message: 'Paynet connection failed',
                 error: result.error,
-                responseStatus: result.responseStatus,
-                responseData: result.responseData
+                responseStatus: result.statusCode,
+                responseData: (result as any).responseData
             });
         }
     } catch (error: any) {

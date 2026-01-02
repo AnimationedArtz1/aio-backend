@@ -1,21 +1,37 @@
 import axios from 'axios';
-import * as crypto from 'crypto';
 import { Pool } from 'pg';
 import { AuthService } from './auth.service';
 
+// Paynet Configuration
 const PAYNET_IS_PRODUCTION = process.env.PAYNETEASY_ENABLE_PRODUCTION === 'true';
-const PAYNET_EASY_URL = process.env.PAYNETEASY_API_URL || 'https://gate.payneteasy.com/paynet/api/v2';
 const PAYNET_PRODUCTION_URL = 'https://api.paynet.com.tr/v2';
-const PAYNET_API_URL = PAYNET_IS_PRODUCTION ? PAYNET_PRODUCTION_URL : PAYNET_EASY_URL;
-const PAYNET_SECRET_KEY = process.env.PAYNETEASY_SECRET_KEY || 'sck_5shZWwD-jVQ0r9DuyF8ZmEWkz3vz';
-const PAYNET_PUBLISHABLE_KEY = process.env.PAYNETEASY_PUBLIC_KEY || 'pbk_SyS8x3O5SPLbL8XvPM91ZIxocMT7';
-const PAYNET_JS_URL = 'https://pj.paynet.com.tr/public/js/paynet.min.js';
+const PAYNET_SANDBOX_URL = 'https://pts-api.paynet.com.tr/v2'; // Sandbox URL
+const PAYNET_API_URL = PAYNET_IS_PRODUCTION ? PAYNET_PRODUCTION_URL : PAYNET_SANDBOX_URL;
+
+// Secret key - Paynet uses "sck_xxx" format
+const PAYNET_SECRET_KEY = process.env.PAYNETEASY_SECRET_KEY || '';
+const PAYNET_PUBLISHABLE_KEY = process.env.PAYNETEASY_PUBLIC_KEY || '';
+const PAYNET_ENDPOINT_ID = process.env.PAYNETEASY_ENDPOINT_ID || '';
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 export class PaynetService {
 
     /**
-     * Paynet ile ödeme başlatma (3D Secure olmadan direkt ödeme)
+     * Generate proper Authorization header for Paynet
+     * Paynet expects: Authorization: Basic base64(secret_key:)
+     * Note: The colon after the key is important!
+     */
+    private static getAuthHeader(): string {
+        // Paynet Basic Auth format: base64(secret_key:)
+        // The colon at the end is required even with no password
+        const credentials = `${PAYNET_SECRET_KEY}:`;
+        const base64Credentials = Buffer.from(credentials).toString('base64');
+        return `Basic ${base64Credentials}`;
+    }
+
+    /**
+     * Create a payment link/session with Paynet
      */
     static async createPaymentLink(params: {
         amount: number;
@@ -25,26 +41,33 @@ export class PaynetService {
         description?: string;
         planId?: string;
     }) {
-        const secretKey = PAYNET_SECRET_KEY;
-
         try {
             console.log('=== PAYNET PAYMENT LINK START ===');
             console.log('API URL:', PAYNET_API_URL);
-            console.log('Secret Key:', secretKey.substring(0, 20) + '...');
+            console.log('Is Production:', PAYNET_IS_PRODUCTION);
+            console.log('Endpoint ID:', PAYNET_ENDPOINT_ID);
+            console.log('Secret Key (first 15 chars):', PAYNET_SECRET_KEY.substring(0, 15) + '...');
             console.log('Amount (kuruş):', params.amount);
             console.log('Amount (TL):', (params.amount / 100).toFixed(2));
 
+            const authHeader = this.getAuthHeader();
+            console.log('Auth Header (first 30 chars):', authHeader.substring(0, 30) + '...');
+
+            // Paynet payment request body
             const paymentData = {
-                amount: (params.amount / 100).toFixed(2),
+                amount: (params.amount / 100).toFixed(2), // Convert kuruş to TL
                 reference_no: params.referenceCode,
                 domain: 'aioasistan.com',
+                card_holder_email: params.email,
                 card_holder: params.name,
-                description: params.description || `AIO Asistan Plan Ödemesi - ${params.planId}`
+                description: params.description || `AIO Asistan Plan Ödemesi - ${params.planId || 'standard'}`,
+                // Optional: Add callback URLs
+                callback_url: 'https://api.aioasistan.com/api/paynet/callback',
+                success_url: 'https://aioasistan.com/payment/success',
+                fail_url: 'https://aioasistan.com/payment/fail'
             };
 
             console.log('Payment Data:', JSON.stringify(paymentData, null, 2));
-
-            const authHeader = 'Basic ' + Buffer.from(secretKey).toString('base64');
 
             const response = await axios.post(
                 `${PAYNET_API_URL}/transaction/payment`,
@@ -60,44 +83,107 @@ export class PaynetService {
             );
 
             console.log('Paynet Response Status:', response.status);
-            console.log('Paynet Response Data:', response.data);
+            console.log('Paynet Response Data:', JSON.stringify(response.data, null, 2));
             console.log('=== PAYNET PAYMENT LINK END ===');
 
-            if (response.status === 200) {
-                const responseData = response.data as any;
-                const { id, xact_id } = responseData;
+            const responseData = response.data as any;
 
-                return {
-                    success: true,
-                    url: `https://aioasistan.com/payment/success?xact_id=${xact_id}`,
-                    paymentId: id,
-                    xactId: xact_id,
-                    referenceCode: params.referenceCode,
-                    paynetJsUrl: PAYNET_JS_URL
-                };
-            }
-
-            throw new Error('Beklenmeyen Paynet yanıtı');
+            return {
+                success: true,
+                url: responseData.redirect_url || responseData.payment_url || `https://aioasistan.com/payment/process?xact_id=${responseData.xact_id}`,
+                paymentId: responseData.id,
+                xactId: responseData.xact_id,
+                sessionId: responseData.session_id || responseData.xact_id,
+                referenceCode: params.referenceCode,
+                raw_response: responseData
+            };
 
         } catch (error: any) {
-            console.error('=== PAYNET CATCH START ===');
+            console.error('=== PAYNET ERROR ===');
             console.error('Error Message:', error.message);
             console.error('Error Code:', error.code);
-            console.error('Response Status:', error.response?.status);
-            console.error('Response Data:', error.response?.data);
-            console.error('=== PAYNET CATCH END ===');
 
-            if (process.env.NODE_ENV === 'production') {
-                throw new Error(error.response?.data?.message || error.message || 'Ödeme başlatılamadı');
+            if (error.response) {
+                console.error('Status:', error.response.status);
+                console.error('Status Text:', error.response.statusText);
+                console.error('Response Headers:', JSON.stringify(error.response.headers, null, 2));
+                console.error('Response Data:', error.response.data);
+
+                // Log specific auth errors
+                if (error.response.status === 401) {
+                    console.error('AUTHENTICATION ERROR: Check your secret key format');
+                    console.error('Expected format: sck_xxxxxxxxx');
+                    console.error('Make sure the key is correctly set in PAYNETEASY_SECRET_KEY env var');
+                }
             }
 
-            console.log('Mock payment link döndürülüyor (dev mode)');
-            return this.getMockPaymentLink(params.referenceCode);
+            // In development, return mock data
+            if (process.env.NODE_ENV !== 'production') {
+                console.log('Returning mock payment link (dev mode)');
+                return this.getMockPaymentLink(params.referenceCode);
+            }
+
+            throw new Error(error.response?.data?.message || error.message || 'Ödeme başlatılamadı');
         }
     }
 
     /**
-     * Paynet Webhook Handler (Ödeme onayı)
+     * Alternative: Create payment with iframe/hosted form
+     */
+    static async createHostedPayment(params: {
+        amount: number;
+        referenceCode: string;
+        email: string;
+        name: string;
+    }) {
+        try {
+            console.log('=== PAYNET HOSTED PAYMENT START ===');
+
+            const authHeader = this.getAuthHeader();
+
+            const paymentData = {
+                amount: (params.amount / 100).toFixed(2),
+                reference_no: params.referenceCode,
+                card_holder_email: params.email,
+                card_holder: params.name,
+                domain: 'aioasistan.com',
+                is_3d: true, // Force 3D Secure
+                callback_url: 'https://api.aioasistan.com/api/paynet/callback'
+            };
+
+            const response = await axios.post(
+                `${PAYNET_API_URL}/transaction/hosted-payment`,
+                paymentData,
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': authHeader
+                    },
+                    timeout: 30000
+                }
+            );
+
+            console.log('Hosted Payment Response:', response.data);
+
+            return {
+                success: true,
+                iframeUrl: response.data.iframe_url,
+                redirectUrl: response.data.redirect_url,
+                xactId: response.data.xact_id
+            };
+
+        } catch (error: any) {
+            console.error('Hosted Payment Error:', error.message);
+            if (error.response) {
+                console.error('Response:', error.response.data);
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * Handle Paynet webhook callback
      */
     static async handleWebhook(webhookData: any) {
         try {
@@ -109,11 +195,13 @@ export class PaynetService {
                 reference_no,
                 email,
                 card_holder,
-                transaction_type
+                transaction_type,
+                amount,
+                xact_id
             } = webhookData;
 
-            if (is_succeed === true || is_succeed === 'true') {
-                console.log(`Ödeme başarılı: ${email}, Ref: ${reference_no}`);
+            if (is_succeed === true || is_succeed === 'true' || is_succeed === 1 || is_succeed === '1') {
+                console.log(`Ödeme başarılı: ${email}, Ref: ${reference_no}, Amount: ${amount}`);
 
                 const tenant = await AuthService.createTenantFromPayment({
                     email,
@@ -123,6 +211,7 @@ export class PaynetService {
 
                 console.log(`Tenant oluşturuldu: ${tenant.slug}, ID: ${tenant.tenantId}`);
 
+                // Assign mock phone number (will be replaced by Verimor)
                 const phoneNumber = '+905550001122';
                 const twilioSid = 'mock_sid_' + Date.now();
 
@@ -142,7 +231,8 @@ export class PaynetService {
                 return {
                     success: true,
                     message: 'Ödeme işlendi, hesap oluşturuldu',
-                    tenantSlug: tenant.slug
+                    tenantSlug: tenant.slug,
+                    xactId: xact_id
                 };
             } else {
                 console.log(`Ödeme başarısız: ${email}, Status: ${is_succeed}`);
@@ -159,7 +249,94 @@ export class PaynetService {
     }
 
     /**
-     * Eski metodlar - geriye uyumluluk için
+     * Check Paynet connection and credentials
+     */
+    static async checkConnection() {
+        try {
+            console.log('=== PAYNET CONNECTION CHECK START ===');
+            console.log('API URL:', PAYNET_API_URL);
+            console.log('Is Production:', PAYNET_IS_PRODUCTION);
+            console.log('Secret Key (first 15 chars):', PAYNET_SECRET_KEY.substring(0, 15) + '...');
+            console.log('Publishable Key (first 15 chars):', PAYNET_PUBLISHABLE_KEY.substring(0, 15) + '...');
+
+            const authHeader = this.getAuthHeader();
+            console.log('Auth Header format check:');
+            console.log('  - Starts with "Basic ": ', authHeader.startsWith('Basic '));
+            console.log('  - Header length:', authHeader.length);
+
+            // Try a minimal request to check auth
+            // Using an endpoint that should return 400 for invalid data but 401 for bad auth
+            const testData = {
+                amount: '0.01',
+                reference_no: 'CONNECTION-TEST-' + Date.now(),
+                domain: 'aioasistan.com',
+                card_holder: 'TEST USER',
+                description: 'Connection test'
+            };
+
+            console.log('Sending test request...');
+
+            const response = await axios.post(
+                `${PAYNET_API_URL}/transaction/payment`,
+                testData,
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': authHeader
+                    },
+                    timeout: 30000,
+                    validateStatus: (status) => status < 500 // Accept 4xx as valid responses
+                }
+            );
+
+            console.log('Response Status:', response.status);
+            console.log('Response Data:', JSON.stringify(response.data, null, 2));
+            console.log('=== PAYNET CONNECTION CHECK END ===');
+
+            // 401 = auth problem, 400/422 = auth OK but data invalid
+            if (response.status === 401 || response.status === 403) {
+                return {
+                    success: false,
+                    error: 'Authentication failed',
+                    statusCode: response.status,
+                    message: 'Check your PAYNETEASY_SECRET_KEY - it should be in format: sck_xxxxxxxx'
+                };
+            }
+
+            return {
+                success: true,
+                message: 'Connection successful - credentials are valid',
+                statusCode: response.status,
+                data: response.data
+            };
+
+        } catch (error: any) {
+            console.error('=== PAYNET CONNECTION ERROR ===');
+            console.error('Error Message:', error.message);
+
+            if (error.response) {
+                console.error('Status:', error.response.status);
+                console.error('Response Data:', error.response.data);
+
+                return {
+                    success: false,
+                    error: error.message,
+                    statusCode: error.response.status,
+                    responseData: error.response.data
+                };
+            }
+
+            return {
+                success: false,
+                error: error.message,
+                message: 'Network or connection error'
+            };
+        }
+    }
+
+    /**
+     * Create session (legacy method for backward compatibility)
      */
     static async createSession(amount: number, referenceCode: string, email: string, name: string) {
         return this.createPaymentLink({
@@ -171,90 +348,18 @@ export class PaynetService {
     }
 
     /**
-     * Check Paynet connection and credentials
-     * Based on: https://doc.paynet.com.tr/oedeme-metotlari/api-entegrasyonu/odeme
-     */
-    static async checkConnection() {
-        try {
-            console.log('=== PAYNET CONNECTION CHECK START ===');
-            console.log('API URL:', PAYNET_API_URL);
-            console.log('Secret Key:', PAYNET_SECRET_KEY.substring(0, 15) + '...');
-            console.log('Publishable Key:', PAYNET_PUBLISHABLE_KEY.substring(0, 15) + '...');
-            console.log('Is Production:', PAYNET_IS_PRODUCTION);
-
-            const authHeader = 'Basic ' + Buffer.from(PAYNET_SECRET_KEY).toString('base64');
-
-            console.log('Auth Header (first 20 chars):', authHeader.substring(0, 20) + '...');
-
-            const testUrl = `${PAYNET_API_URL}/transaction/payment`;
-
-            console.log('Testing URL:', testUrl);
-
-            const testData = {
-                amount: '0.01',
-                reference_no: 'TEST-' + Date.now(),
-                domain: 'aioasistan.com',
-                card_holder: 'CONNECTION TEST',
-                pan: '0000000000000',
-                month: new Date().getMonth() + 1,
-                year: new Date().getFullYear(),
-                description: 'Connection test for AIO Asistan'
-            };
-
-            console.log('Test Data:', JSON.stringify(testData, null, 2));
-
-            const response = await axios.post(testUrl, testData, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'Authorization': authHeader
-                },
-                timeout: 30000
-            });
-
-            console.log('Paynet Response Status:', response.status);
-            console.log('Paynet Response Data:', JSON.stringify(response.data, null, 2));
-            console.log('=== PAYNET CONNECTION CHECK END ===');
-
-            return {
-                success: response.status === 200,
-                data: response.data,
-                statusCode: response.status
-            };
-
-        } catch (error: any) {
-            console.error('=== PAYNET CONNECTION ERROR ===');
-            console.error('Error Message:', error.message);
-            console.error('Error Code:', error.code);
-
-            if (error.response) {
-                console.error('Status:', error.response.status);
-                console.error('Status Text:', error.response.statusText);
-                console.error('Response Headers:', JSON.stringify(error.response.headers, null, 2));
-                console.error('Response Data:', typeof error.response.data === 'string' ? error.response.data.substring(0, 500) : error.response.data);
-            } else if (error.request) {
-                console.error('No response received');
-            }
-
-            return {
-                success: false,
-                error: error.message,
-                responseStatus: error.response?.status,
-                responseData: error.response?.data
-            };
-        }
-    }
-
-    /**
-     * Mock payment link (test için)
+     * Mock payment link for development
      */
     private static getMockPaymentLink(referenceCode: string) {
+        console.log('=== GENERATING MOCK PAYMENT LINK ===');
         return {
             success: true,
-            url: `https://aioasistan.com/payment/success?mock=true&ref=${referenceCode}`,
-            paymentId: `mock-session-${Date.now()}`,
+            url: `https://aioasistan.com/payment/mock?ref=${referenceCode}`,
+            paymentId: `mock-payment-${Date.now()}`,
+            sessionId: `mock-session-${Date.now()}`,
+            xactId: `mock-xact-${Date.now()}`,
             referenceCode: referenceCode,
             mock: true
-        } as any;
+        };
     }
 }

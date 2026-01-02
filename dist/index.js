@@ -7,6 +7,9 @@ const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const path_1 = __importDefault(require("path"));
+const fs_1 = __importDefault(require("fs"));
+const multer_1 = __importDefault(require("multer"));
 const pg_1 = require("pg");
 const auth_service_1 = require("./services/auth.service");
 const paynet_service_1 = require("./services/paynet.service");
@@ -18,9 +21,46 @@ dotenv_1.default.config();
 const app = (0, express_1.default)();
 const pool = new pg_1.Pool({ connectionString: process.env.DATABASE_URL });
 const JWT_SECRET = process.env.JWT_SECRET || 'super_gizli_jwt_sifresi_bunu_degistir';
-// CORS: Hepsine izin ver
+// Ensure public/audio directory exists
+const AUDIO_DIR = path_1.default.join(__dirname, '..', 'public', 'audio');
+if (!fs_1.default.existsSync(AUDIO_DIR)) {
+    fs_1.default.mkdirSync(AUDIO_DIR, { recursive: true });
+    console.log('Created audio directory:', AUDIO_DIR);
+}
+// Configure multer for audio file uploads
+const audioStorage = multer_1.default.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, AUDIO_DIR);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const ext = path_1.default.extname(file.originalname) || '.mp3';
+        cb(null, `audio-${uniqueSuffix}${ext}`);
+    }
+});
+const audioUpload = (0, multer_1.default)({
+    storage: audioStorage,
+    limits: {
+        fileSize: 10 * 1024 * 1024 // 10MB max
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedMimes = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/ogg', 'audio/webm'];
+        if (allowedMimes.includes(file.mimetype)) {
+            cb(null, true);
+        }
+        else {
+            cb(new Error('Invalid file type. Only audio files are allowed.'));
+        }
+    }
+});
+// CORS: Allow all origins
 app.use((0, cors_1.default)({ origin: '*' }));
+// Parse JSON bodies
 app.use(express_1.default.json());
+// Parse URL-encoded bodies (important for Verimor webhooks)
+app.use(express_1.default.urlencoded({ extended: true }));
+// Serve static files from public directory
+app.use('/public', express_1.default.static(path_1.default.join(__dirname, '..', 'public')));
 // Request Logging
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
@@ -55,7 +95,7 @@ apiRouter.post('/paynet/create-session', async (req, res) => {
             success: true,
             url: result.url,
             referenceCode: fullRef,
-            sessionId: result.session_id
+            sessionId: result.sessionId
         });
     }
     catch (e) {
@@ -106,7 +146,7 @@ apiRouter.post('/billing/checkout', async (req, res) => {
         res.json({
             redirectUrl: result.url,
             checkoutUrl: result.url,
-            sessionId: result.session_id
+            sessionId: result.sessionId
         });
     }
     catch (e) {
@@ -282,121 +322,166 @@ apiRouter.stack.forEach((layer) => {
 });
 console.log('[ROUTE] apiRouter mounted on /api');
 // ============================================
-// Verimor Call Integration - For n8n triggering
+// VERIMOR ROBUST WEBHOOK HANDLER
+// This handler responds 200 OK IMMEDIATELY to prevent 404/timeout errors
+// It handles GET (validation) and POST (events) requests
 // ============================================
-apiRouter.post('/integrations/verimor/call', async (req, res) => {
+const handleVerimorWebhook = async (req, res) => {
+    // CRITICAL: Send 200 OK immediately to prevent Verimor timeout/error
+    // We send response BEFORE processing to ensure Verimor gets OK
+    const timestamp = new Date().toISOString();
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║           VERIMOR WEBHOOK RECEIVED                           ║');
+    console.log('╠══════════════════════════════════════════════════════════════╣');
+    console.log(`║ Timestamp: ${timestamp}`);
+    console.log(`║ Method: ${req.method}`);
+    console.log(`║ Path: ${req.path}`);
+    console.log(`║ Original URL: ${req.originalUrl}`);
+    console.log(`║ Content-Type: ${req.get('content-type') || 'none'}`);
+    console.log('╚══════════════════════════════════════════════════════════════╝');
     try {
-        const { target_number } = req.body;
-        if (!target_number) {
-            return res.status(400).json({ error: 'target_number is required' });
-        }
-        const DEMO_EXTENSION = '902422555761';
-        console.log('=== VERIMOR CALL REQUEST ===');
-        console.log('Extension (Source):', DEMO_EXTENSION);
-        console.log('Destination (Target):', target_number);
-        const result = await verimor_service_1.VerimorService.makeCall(DEMO_EXTENSION, target_number);
-        if (result.success) {
-            res.json({
-                success: true,
-                message: 'Call initiated',
-                data: result.data
-            });
+        // Extract data from query params (GET) or body (POST)
+        let data = {};
+        if (req.method === 'GET') {
+            data = { ...req.query };
+            console.log('[Verimor] Using query parameters (GET validation request)');
         }
         else {
-            res.status(500).json({
-                success: false,
-                message: result.message
-            });
+            // POST - could be JSON or form-urlencoded
+            data = { ...req.query, ...req.body };
+            console.log('[Verimor] Using body + query (POST event request)');
         }
+        console.log('[Verimor] Parsed Data:', JSON.stringify(data, null, 2));
+        console.log('[Verimor] UUID:', data.uuid || 'N/A');
+        console.log('[Verimor] CLI (Caller):', data.cli || 'N/A');
+        console.log('[Verimor] CLD (Called):', data.cld || 'N/A');
+        console.log('[Verimor] Step:', data.step || 'N/A');
+        console.log('[Verimor] Event:', data.event || 'N/A');
+        // Forward to n8n asynchronously (don't wait for response)
+        setImmediate(async () => {
+            try {
+                const n8nResponse = await verimor_service_1.VerimorService.forwardToN8n(data);
+                if (n8nResponse) {
+                    console.log('[Verimor->n8n] Forward successful:', n8nResponse);
+                }
+            }
+            catch (err) {
+                console.error('[Verimor->n8n] Forward error:', err.message);
+            }
+        });
+        // Return 200 OK with simple response
+        // Verimor expects either plain text 'OK' or simple JSON
+        res.status(200).send('OK');
     }
     catch (error) {
-        console.error('Verimor Call Error:', error.message);
-        res.status(500).json({ error: error.message });
+        console.error('[Verimor] Webhook processing error:', error.message);
+        // STILL return 200 OK to prevent Verimor from marking webhook as failed
+        res.status(200).send('OK');
+    }
+};
+// ============================================
+// MOUNT VERIMOR WEBHOOK ON ALL PATH VARIATIONS
+// Using app.all() to catch GET, POST, PUT, DELETE, OPTIONS etc.
+// ============================================
+const verimorPaths = [
+    '/api/verimor/incoming-call',
+    '/api/verimor/incoming-call/',
+    '/verimor/incoming-call',
+    '/verimor/incoming-call/',
+    '/api/verimor/webhook',
+    '/api/verimor/webhook/',
+    '/verimor/webhook',
+    '/verimor/webhook/',
+    '/api/webhook/verimor',
+    '/api/webhook/verimor/',
+    '/webhook/verimor',
+    '/webhook/verimor/'
+];
+verimorPaths.forEach(p => {
+    app.all(p, handleVerimorWebhook);
+    console.log(`[VERIMOR] Mounted catch-all on: ${p}`);
+});
+// ============================================
+// AUDIO UPLOAD ENDPOINT - For n8n Voice AI
+// n8n generates TTS audio and uploads here
+// Returns public URL for Verimor to play
+// ============================================
+app.post('/api/upload-audio', audioUpload.single('audio'), (req, res) => {
+    try {
+        console.log('=== AUDIO UPLOAD REQUEST ===');
+        if (!req.file) {
+            console.error('No audio file in request');
+            return res.status(400).json({
+                success: false,
+                error: 'No audio file provided. Use field name "audio"'
+            });
+        }
+        const filename = req.file.filename;
+        const publicUrl = `https://api.aioasistan.com/public/audio/${filename}`;
+        const localUrl = `http://localhost:${process.env.PORT || 3000}/public/audio/${filename}`;
+        console.log('File saved:', req.file.path);
+        console.log('Public URL:', publicUrl);
+        console.log('Local URL:', localUrl);
+        res.json({
+            success: true,
+            filename: filename,
+            url: publicUrl,
+            localUrl: localUrl,
+            size: req.file.size,
+            mimetype: req.file.mimetype
+        });
+    }
+    catch (error) {
+        console.error('Audio upload error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+// Also mount on path without /api prefix
+app.post('/upload-audio', audioUpload.single('audio'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No audio file provided' });
+        }
+        const filename = req.file.filename;
+        const publicUrl = `https://api.aioasistan.com/public/audio/${filename}`;
+        res.json({
+            success: true,
+            filename: filename,
+            url: publicUrl,
+            size: req.file.size
+        });
+    }
+    catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 // ============================================
-// Verimor Incoming Call Webhook - For Verimor Panel
+// VERIMOR PLAY AUDIO RESPONSE HELPER ENDPOINT
+// Returns proper JSON command for Verimor to play audio
 // ============================================
-const handleVerimorWebhook = async (req, res) => {
+app.post('/api/verimor/play', express_1.default.json(), (req, res) => {
     try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        console.log('Content-Type:', req.get('content-type'));
-        let data = {};
-        if (req.method === 'GET') {
-            data = req.query;
-            console.log('Using query parameters (GET)');
-        }
-        else if (req.method === 'POST') {
-            const contentType = req.get('content-type');
-            if (contentType && contentType.includes('application/x-www-form-urlencoded')) {
-                console.log('Using form-encoded body (POST)');
-                data = req.body;
-            }
-            else if (contentType && contentType.includes('application/json')) {
-                console.log('Using JSON body (POST)');
-                data = req.body;
-            }
-            else {
-                console.log('Using both query and body (fallback)');
-                data = { ...req.query, ...req.body };
-            }
-        }
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        return res.status(200).send('OK');
+        const { audio_url, uuid } = req.body;
+        console.log('=== VERIMOR PLAY AUDIO ===');
+        console.log('Audio URL:', audio_url);
+        console.log('Call UUID:', uuid);
+        // Return Verimor-compatible response
+        res.json({
+            success: true,
+            action: 'play',
+            audio_url: audio_url,
+            uuid: uuid
+        });
     }
     catch (error) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
+        console.error('Play audio error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
-};
-// Mount Verimor webhook on all 4 path variations on app directly
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
-// ============================================
-// ============================================
-// Verimor Shared Webhook Handler - Prevents trailing slash & redirects
-// ============================================
-const handleVerimorWebhook = async (req, res) => {
-    try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        const data = req.query || req.body || {};
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        return res.status(200).send('OK');
-    }
-    catch (error) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
-    }
-};
-// Mount on all 4 path variations
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
+});
 // ============================================
 // AUTH MIDDLEWARE
 // ============================================
@@ -610,37 +695,6 @@ apiRouter.get('/admin/verimor/numbers', async (req, res) => {
     }
 });
 // ============================================
-// Verimor Shared Webhook Handler - Prevents trailing slash & redirects
-// ============================================
-const handleVerimorWebhook = async (req, res) => {
-    try {
-        console.log('=== VERIMOR WEBHOOK HIT ===');
-        console.log('Method:', req.method);
-        console.log('Path:', req.path);
-        console.log('Query:', req.query);
-        console.log('Body:', req.body);
-        const data = req.query || req.body || {};
-        console.log('UUID:', data.uuid);
-        console.log('CLI:', data.cli);
-        console.log('CLD:', data.cld);
-        console.log('Step:', data.step);
-        return res.status(200).send('OK');
-    }
-    catch (error) {
-        console.error('Verimor Webhook Error:', error.message);
-        return res.status(200).send('OK');
-    }
-};
-// Mount on all 4 path variations to prevent trailing slash issues
-app.get('/api/verimor/incoming-call', handleVerimorWebhook);
-app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.get('/verimor/incoming-call', handleVerimorWebhook);
-app.get('/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call', handleVerimorWebhook);
-app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
-app.all('/verimor/incoming-call', handleVerimorWebhook);
-app.all('/verimor/incoming-call/', handleVerimorWebhook);
-// ============================================
 // Health check
 apiRouter.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -662,7 +716,7 @@ apiRouter.post('/payment/test-connection', async (req, res) => {
                 success: false,
                 message: 'Paynet connection failed',
                 error: result.error,
-                responseStatus: result.responseStatus,
+                responseStatus: result.statusCode,
                 responseData: result.responseData
             });
         }
