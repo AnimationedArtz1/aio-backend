@@ -337,6 +337,100 @@ apiRouter.stack.forEach((layer: any) => {
 console.log('[ROUTE] apiRouter mounted on /api');
 
 // ============================================
+// Verimor Call Integration - For n8n triggering
+// ============================================
+apiRouter.post('/integrations/verimor/call', async (req, res) => {
+    try {
+        const { target_number } = req.body;
+        
+        if (!target_number) {
+            return res.status(400).json({ error: 'target_number is required' });
+        }
+        
+        const DEMO_EXTENSION = '902422555761';
+        
+        console.log('=== VERIMOR CALL REQUEST ===');
+        console.log('Extension (Source):', DEMO_EXTENSION);
+        console.log('Destination (Target):', target_number);
+        
+        const result = await VerimorService.makeCall(DEMO_EXTENSION, target_number);
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: 'Call initiated',
+                data: result.data
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                message: result.message
+            });
+        }
+    } catch (error: any) {
+        console.error('Verimor Call Error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================
+// Verimor Incoming Call Webhook - For Verimor Panel
+// ============================================
+const handleVerimorWebhook = async (req: any, res: any) => {
+    try {
+        console.log('=== VERIMOR WEBHOOK HIT ===');
+        console.log('Method:', req.method);
+        console.log('Path:', req.path);
+        console.log('Query:', req.query);
+        console.log('Body:', req.body);
+        console.log('Content-Type:', req.get('content-type'));
+        
+        let data: any = {};
+        
+        if (req.method === 'GET') {
+            data = req.query;
+            console.log('Using query parameters (GET)');
+        } else if (req.method === 'POST') {
+            const contentType = req.get('content-type');
+            
+            if (contentType && contentType.includes('application/x-www-form-urlencoded')) {
+                console.log('Using form-encoded body (POST)');
+                data = req.body;
+            } else if (contentType && contentType.includes('application/json')) {
+                console.log('Using JSON body (POST)');
+                data = req.body;
+            } else {
+                console.log('Using both query and body (fallback)');
+                data = { ...req.query, ...req.body };
+            }
+        }
+        
+        console.log('UUID:', data.uuid);
+        console.log('CLI:', data.cli);
+        console.log('CLD:', data.cld);
+        console.log('Step:', data.step);
+        
+        return res.status(200).send('OK');
+    } catch (error: any) {
+        console.error('Verimor Webhook Error:', error.message);
+        return res.status(200).send('OK');
+    }
+};
+
+// Mount Verimor webhook on all 4 path variations on app directly
+app.get('/api/verimor/incoming-call', handleVerimorWebhook);
+app.get('/api/verimor/incoming-call/', handleVerimorWebhook);
+app.get('/verimor/incoming-call', handleVerimorWebhook);
+app.get('/verimor/incoming-call/', handleVerimorWebhook);
+
+app.all('/api/verimor/incoming-call', handleVerimorWebhook);
+app.all('/api/verimor/incoming-call/', handleVerimorWebhook);
+app.all('/verimor/incoming-call', handleVerimorWebhook);
+app.all('/verimor/incoming-call/', handleVerimorWebhook);
+
+// ============================================
+
+// ============================================
 // Verimor Shared Webhook Handler - Prevents trailing slash & redirects
 // ============================================
 const handleVerimorWebhook = async (req: any, res: any) => {

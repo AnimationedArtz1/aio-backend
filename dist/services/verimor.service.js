@@ -28,7 +28,7 @@ class VerimorService {
             };
         }
         try {
-            const url = `${VERIMOR_BASE_URL}/originate`;
+            const url = `${VERIMOR_BASE_URL}/begin_call`;
             console.log('=== VERIMOR API CALL ===');
             console.log('URL:', url);
             console.log('Extension:', cleanExtension);
