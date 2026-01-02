@@ -435,34 +435,61 @@ const handleVerimorWebhook = async (req: any, res: any) => {
             }
         });
 
-        // Return 200 OK with simple response
-        // Verimor expects either plain text 'OK' or simple JSON
-        res.status(200).send('OK');
+        // Return 200 OK with JSON response
+        // Verimor API requires JSON with transfer.target field
+        // See: https://github.com/verimor/Bulutsantralim-API/blob/master/advisory_webhook.md
+
+        // Default response: transfer to a queue or hangup
+        // You can customize this based on your needs
+        const defaultTarget = process.env.VERIMOR_DEFAULT_TARGET || 'hangup/hangup';
+
+        res.status(200).json({
+            transfer: {
+                target: defaultTarget
+            }
+        });
 
     } catch (error: any) {
         console.error('[Verimor] Webhook processing error:', error.message);
-        // STILL return 200 OK to prevent Verimor from marking webhook as failed
-        res.status(200).send('OK');
+        // Return valid JSON even on error
+        res.status(200).json({
+            transfer: {
+                target: 'hangup/hangup'
+            }
+        });
     }
 };
 
 // ============================================
 // MOUNT VERIMOR WEBHOOK ON ALL PATH VARIATIONS
 // Using app.all() to catch GET, POST, PUT, DELETE, OPTIONS etc.
+// Including .json extensions as per Verimor API docs
 // ============================================
 const verimorPaths = [
+    // Standard paths
     '/api/verimor/incoming-call',
     '/api/verimor/incoming-call/',
     '/verimor/incoming-call',
     '/verimor/incoming-call/',
+    // With .json extension (Verimor API format)
+    '/api/verimor/incoming-call.json',
+    '/verimor/incoming-call.json',
+    '/api/verimor.json',
+    '/verimor.json',
+    // Alternative webhook paths
     '/api/verimor/webhook',
     '/api/verimor/webhook/',
     '/verimor/webhook',
     '/verimor/webhook/',
+    '/api/verimor/webhook.json',
+    '/verimor/webhook.json',
+    // Other variations
     '/api/webhook/verimor',
     '/api/webhook/verimor/',
     '/webhook/verimor',
-    '/webhook/verimor/'
+    '/webhook/verimor/',
+    '/api/webhook/verimor.json',
+    '/webhook/verimor.json'
 ];
 
 verimorPaths.forEach(p => {
