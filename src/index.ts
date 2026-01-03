@@ -10,7 +10,6 @@ import multer from 'multer';
 import { Pool } from 'pg';
 import { AuthService } from './services/auth.service';
 import { PaynetService } from './services/paynet.service';
-import { TwilioService } from './services/twilio.service';
 import { AgentService } from './services/agent.service';
 import { UserService } from './services/user.service';
 import { VerimorService, VerimorWebhookData } from './services/verimor.service';
@@ -303,30 +302,15 @@ apiRouter.post('/paynet/callback', async (req, res) => {
             } catch (verimorErr: any) {
                 console.error('Verimor numarası atanamadı:', verimorErr.message);
 
-                // Verimor havuzunda numara yoksa Twilio'a fallback yap
-                console.log('Twilio fallback başlatılıyor...');
+                // Verimor havuzunda numara yoksa mock numara ata
+                console.log('Mock numara atanacak...');
+                phoneNumber = '+905550001122';
+                assignmentType = 'mock';
 
-                try {
-                    const phone = await TwilioService.buyPhoneNumber(tenant.slug);
-                    phoneNumber = phone.phoneNumber;
-                    assignmentType = 'twilio';
-
-                    await pool.query(
-                        'UPDATE agents SET twilio_phone_number = $1, twilio_sid = $2 WHERE tenant_id = $3',
-                        [phone.phoneNumber, phone.sid, tenant.tenantId]
-                    );
-
-                    console.log(`Twilio numarası atandı: ${phone.phoneNumber}`);
-                } catch (twilioErr: any) {
-                    console.error('Twilio numara alınamadı (mock kullanılacak):', twilioErr.message);
-                    phoneNumber = '+905550001122';
-                    assignmentType = 'mock';
-
-                    await pool.query(
-                        'UPDATE agents SET twilio_phone_number = $1 WHERE tenant_id = $2',
-                        [phoneNumber, tenant.tenantId]
-                    );
-                }
+                await pool.query(
+                    'UPDATE agents SET verimor_did = $1 WHERE tenant_id = $2',
+                    [phoneNumber, tenant.tenantId]
+                );
             }
 
             // 4. Log (Email servisi eklenince burası değişecek)
@@ -743,13 +727,13 @@ apiRouter.post('/quota/increment', async (req, res) => {
     }
 });
 
-// n8n Webhook (n8n'den gelen Twilio webhook'unu karşıla)
+// n8n Webhook (n8n'den gelen voice webhook'unu karşıla)
 apiRouter.post('/n8n/webhook', async (req, res) => {
     try {
         console.log('=== N8N WEBHOOK RECEIVED ===');
         console.log('Webhook Data:', JSON.stringify(req.body, null, 2));
 
-        // Twilio Voice Request formatı: { CallSid, From, To, CallStatus, CallerName, ... }
+        // Voice Request formatı: { From, To, CallSid, CallStatus, ... }
         const { From: caller, To: callee, CallSid, CallStatus } = req.body;
 
         // Arayan numara (caller) veya aranılan numara (callee) al
@@ -758,14 +742,13 @@ apiRouter.post('/n8n/webhook', async (req, res) => {
         console.log(`Aranan numara: ${phoneNumber}`);
 
         // Agent bilgilerini getir (aranan numaraya göre)
-        // Hem Twilio hem Verimor numaralarını kontrol et
         const agentResult = await pool.query(
             `SELECT a.*, t.name as tenant_name, t.slug as tenant_slug, q.monthly_message_limit, q.current_message_count
              FROM agents a
              JOIN tenants t ON a.tenant_id = t.id
              LEFT JOIN quotas q ON t.id = q.tenant_id
-             WHERE a.twilio_phone_number = $1 OR a.verimor_did = $1`,
-            [phoneNumber, phoneNumber]
+             WHERE a.verimor_did = $1`,
+            [phoneNumber]
         );
 
         if (agentResult.rows.length === 0) {
@@ -782,18 +765,16 @@ apiRouter.post('/n8n/webhook', async (req, res) => {
         console.log('System Prompt:', agent.system_prompt);
         console.log('Tenant:', agent.tenant_slug);
 
-        // n8n için TwiML response
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather>
-    <Say>Hello! AIO Asistanınız ile görüşüyorsunuz.</Say>
-  </Gather>
-</Response>`;
-
-        console.log('Twilio Response:', twiml);
-
-        res.setHeader('Content-Type', 'application/xml');
-        res.send(twiml);
+        // n8n için JSON response (agent bilgileri)
+        res.json({
+            success: true,
+            agent: {
+                name: agent.name,
+                systemPrompt: agent.system_prompt,
+                model: agent.model,
+                tenantSlug: agent.tenant_slug
+            }
+        });
 
     } catch (error: any) {
         console.error('N8n Webhook Error:', error.message);
