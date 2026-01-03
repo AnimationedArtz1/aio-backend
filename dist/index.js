@@ -5,6 +5,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
+const helmet_1 = __importDefault(require("helmet"));
+const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const path_1 = __importDefault(require("path"));
@@ -18,15 +20,88 @@ const agent_service_1 = require("./services/agent.service");
 const user_service_1 = require("./services/user.service");
 const verimor_service_1 = require("./services/verimor.service");
 dotenv_1.default.config();
+// ============================================
+// ENVIRONMENT VALIDATION
+// ============================================
+const requiredEnvVars = ['DATABASE_URL', 'JWT_SECRET'];
+for (const envVar of requiredEnvVars) {
+    if (!process.env[envVar]) {
+        console.error(`❌ Missing required environment variable: ${envVar}`);
+        process.exit(1);
+    }
+}
 const app = (0, express_1.default)();
 const pool = new pg_1.Pool({ connectionString: process.env.DATABASE_URL });
-const JWT_SECRET = process.env.JWT_SECRET || 'super_gizli_jwt_sifresi_bunu_degistir';
+const JWT_SECRET = process.env.JWT_SECRET;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// ============================================
+// PRODUCTION SECURITY MIDDLEWARE
+// ============================================
+// Helmet: Set security HTTP headers
+app.use((0, helmet_1.default)({
+    contentSecurityPolicy: false, // Disable CSP for API
+    crossOriginEmbedderPolicy: false
+}));
+// Rate Limiting: Prevent DDoS attacks
+const generalLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Max 100 requests per IP per window
+    message: { error: 'Too many requests, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+const authLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Max 10 login attempts per IP
+    message: { error: 'Too many login attempts, please try again later.' }
+});
+const paymentLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 60 * 1000, // 1 minute
+    max: 5, // Max 5 payment requests per IP per minute
+    message: { error: 'Too many payment requests, please try again later.' }
+});
+// Apply general rate limit to all requests
+app.use(generalLimiter);
+// CORS: Production-ready configuration
+const allowedOrigins = [
+    'https://aioasistan.com',
+    'https://www.aioasistan.com',
+    'https://app.aioasistan.com',
+    'https://api.aioasistan.com'
+];
+// Add localhost for development
+if (!IS_PRODUCTION) {
+    allowedOrigins.push('http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173');
+}
+app.use((0, cors_1.default)({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (mobile apps, Postman, webhooks)
+        if (!origin)
+            return callback(null, true);
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        }
+        else {
+            console.warn(`CORS blocked origin: ${origin}`);
+            callback(null, false);
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+// Parse JSON bodies with size limit
+app.use(express_1.default.json({ limit: '10mb' }));
+// Parse URL-encoded bodies (important for Verimor webhooks)
+app.use(express_1.default.urlencoded({ extended: true, limit: '10mb' }));
 // Ensure public/audio directory exists
 const AUDIO_DIR = path_1.default.join(__dirname, '..', 'public', 'audio');
 if (!fs_1.default.existsSync(AUDIO_DIR)) {
     fs_1.default.mkdirSync(AUDIO_DIR, { recursive: true });
     console.log('Created audio directory:', AUDIO_DIR);
 }
+// Serve static files from public directory
+app.use('/public', express_1.default.static(path_1.default.join(__dirname, '..', 'public')));
 // Configure multer for audio file uploads
 const audioStorage = multer_1.default.diskStorage({
     destination: (req, file, cb) => {
@@ -53,25 +128,18 @@ const audioUpload = (0, multer_1.default)({
         }
     }
 });
-// CORS: Allow all origins
-app.use((0, cors_1.default)({ origin: '*' }));
-// Parse JSON bodies
-app.use(express_1.default.json());
-// Parse URL-encoded bodies (important for Verimor webhooks)
-app.use(express_1.default.urlencoded({ extended: true }));
-// Serve static files from public directory
-app.use('/public', express_1.default.static(path_1.default.join(__dirname, '..', 'public')));
 // Request Logging
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${req.method} ${req.path} - IP: ${req.ip}`);
     next();
 });
 const apiRouter = express_1.default.Router();
 // ============================================
 // PUBLIC ROUTES (Auth gerektirmeyen)
 // ============================================
-// Login
-apiRouter.post('/auth/login', async (req, res) => {
+// Login - with auth rate limiter
+apiRouter.post('/auth/login', authLimiter, async (req, res) => {
     try {
         console.log('Login Request:', req.body);
         const { email, password } = req.body;
@@ -83,8 +151,8 @@ apiRouter.post('/auth/login', async (req, res) => {
         res.status(401).json({ error: e.message });
     }
 });
-// Paynet - Ödeme oturumu oluştur
-apiRouter.post('/paynet/create-session', async (req, res) => {
+// Paynet - Ödeme oturumu oluştur (with payment rate limiter)
+apiRouter.post('/paynet/create-session', paymentLimiter, async (req, res) => {
     try {
         const { amount, email, name, planId } = req.body;
         const referenceCode = 'ORDER-' + Date.now();
@@ -124,8 +192,8 @@ apiRouter.post('/public/signup', async (req, res) => {
         res.status(500).json({ error: e.message });
     }
 });
-// Billing Checkout - Frontend'in beklediği endpoint
-apiRouter.post('/billing/checkout', async (req, res) => {
+// Billing Checkout - Frontend'in beklediği endpoint (with payment rate limiter)
+apiRouter.post('/billing/checkout', paymentLimiter, async (req, res) => {
     try {
         const { planId } = req.body;
         console.log('Billing Checkout Request:', planId);
@@ -752,8 +820,56 @@ apiRouter.post('/payment/test-connection', async (req, res) => {
     }
 });
 app.use('/api', apiRouter);
-const port = Number(process.env.PORT) || 3000;
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Server running on port ${port}`);
-    console.log(`Health check: http://localhost:${port}/api/health`);
+// ============================================
+// GLOBAL ERROR HANDLER
+// ============================================
+app.use((err, req, res, next) => {
+    console.error('❌ Unhandled Error:', err.stack || err.message);
+    // Don't leak error details in production
+    const errorResponse = IS_PRODUCTION
+        ? { error: 'Internal Server Error' }
+        : { error: err.message, stack: err.stack };
+    res.status(err.status || 500).json(errorResponse);
 });
+// 404 Handler
+app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+});
+// ============================================
+// SERVER STARTUP & GRACEFUL SHUTDOWN
+// ============================================
+const port = Number(process.env.PORT) || 3000;
+const server = app.listen(port, '0.0.0.0', () => {
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║              AIO ASISTAN BACKEND v1.0.0                       ║');
+    console.log('╠══════════════════════════════════════════════════════════════╣');
+    console.log(`║ 🚀 Server running on port ${port}                               ║`);
+    console.log(`║ 🔒 Environment: ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}                            ║`);
+    console.log(`║ 📍 Health check: http://localhost:${port}/api/health             ║`);
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log('');
+});
+// Graceful shutdown
+const gracefulShutdown = async (signal) => {
+    console.log(`\n⚠️ Received ${signal}. Shutting down gracefully...`);
+    server.close(async () => {
+        console.log('✅ HTTP server closed');
+        try {
+            await pool.end();
+            console.log('✅ Database pool closed');
+        }
+        catch (err) {
+            console.error('❌ Error closing database pool:', err);
+        }
+        console.log('👋 Goodbye!');
+        process.exit(0);
+    });
+    // Force close after 30 seconds
+    setTimeout(() => {
+        console.error('❌ Forced shutdown after timeout');
+        process.exit(1);
+    }, 30000);
+};
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

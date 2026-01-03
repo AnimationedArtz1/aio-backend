@@ -16,6 +16,9 @@ const PAYNET_API_URL = PAYNET_IS_PRODUCTION ? PAYNET_PRODUCTION_URL : PAYNET_SAN
 const PAYNET_SECRET_KEY = process.env.PAYNETEASY_SECRET_KEY || '';
 const PAYNET_PUBLISHABLE_KEY = process.env.PAYNETEASY_PUBLIC_KEY || '';
 const PAYNET_ENDPOINT_ID = process.env.PAYNETEASY_ENDPOINT_ID || '';
+// MANDATORY parameters provided by Paynet Support for Multi-IBAN routing
+const PAYNET_RATIO_CODE = 'e0e42b82';
+const PAYNET_IBAN = 'TR880011100000000162000273';
 const pool = new pg_1.Pool({ connectionString: process.env.DATABASE_URL });
 class PaynetService {
     /**
@@ -45,6 +48,7 @@ class PaynetService {
             const authHeader = this.getAuthHeader();
             console.log('Auth Header (first 30 chars):', authHeader.substring(0, 30) + '...');
             // Paynet payment request body
+            // MANDATORY: ratio_code and iban are required by Paynet Support
             const paymentData = {
                 amount: (params.amount / 100).toFixed(2), // Convert kuruş to TL
                 reference_no: params.referenceCode,
@@ -52,7 +56,11 @@ class PaynetService {
                 card_holder_email: params.email,
                 card_holder: params.name,
                 description: params.description || `AIO Asistan Plan Ödemesi - ${params.planId || 'standard'}`,
-                // Optional: Add callback URLs
+                // MANDATORY: Multi-IBAN routing parameters
+                ratio_code: PAYNET_RATIO_CODE,
+                iban: PAYNET_IBAN,
+                transaction_type: '1', // Sales transaction
+                // Callback URLs
                 callback_url: 'https://api.aioasistan.com/api/paynet/callback',
                 success_url: 'https://aioasistan.com/payment/success',
                 fail_url: 'https://aioasistan.com/payment/fail'
@@ -111,6 +119,7 @@ class PaynetService {
         try {
             console.log('=== PAYNET HOSTED PAYMENT START ===');
             const authHeader = this.getAuthHeader();
+            // MANDATORY: ratio_code and iban are required by Paynet Support
             const paymentData = {
                 amount: (params.amount / 100).toFixed(2),
                 reference_no: params.referenceCode,
@@ -118,6 +127,10 @@ class PaynetService {
                 card_holder: params.name,
                 domain: 'aioasistan.com',
                 is_3d: true, // Force 3D Secure
+                // MANDATORY: Multi-IBAN routing parameters
+                ratio_code: PAYNET_RATIO_CODE,
+                iban: PAYNET_IBAN,
+                transaction_type: '1', // Sales transaction
                 callback_url: 'https://api.aioasistan.com/api/paynet/callback'
             };
             const response = await axios_1.default.post(`${PAYNET_API_URL}/transaction/hosted-payment`, paymentData, {
@@ -207,12 +220,16 @@ class PaynetService {
             console.log('  - Header length:', authHeader.length);
             // Try a minimal request to check auth
             // Using an endpoint that should return 400 for invalid data but 401 for bad auth
+            // MANDATORY: Include ratio_code and iban as required by Paynet Support
             const testData = {
                 amount: '0.01',
                 reference_no: 'CONNECTION-TEST-' + Date.now(),
                 domain: 'aioasistan.com',
                 card_holder: 'TEST USER',
-                description: 'Connection test'
+                description: 'Connection test',
+                ratio_code: PAYNET_RATIO_CODE,
+                iban: PAYNET_IBAN,
+                transaction_type: '1'
             };
             console.log('Sending test request...');
             const response = await axios_1.default.post(`${PAYNET_API_URL}/transaction/payment`, testData, {
